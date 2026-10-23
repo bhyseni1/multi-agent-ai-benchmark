@@ -1,0 +1,159 @@
+"""Real paired experiment: one-call agent vs. two-role revise agent on ARC-Challenge.
+
+No synthetic benchmark outputs. Designed for CPU runners, no paid API credentials.
+"""
+from __future__ import annotations
+import argparse, csv, hashlib, json, math, os, platform, random, re, statistics, sys, time
+from collections import defaultdict
+from datetime import datetime, timezone
+from pathlib import Path
+
+DATASET_ID = 'allenai/ai2_arc'
+MODELS = ('google/flan-t5-small', 'google/flan-t5-base')
+
+def sha256(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+def parse_letter(text, allowed):
+    """Conservative parser: never award credit to an ambiguous completion."""
+    value = text.strip().upper()
+    if value in allowed: return value
+    m = re.fullmatch(r'(?:ANSWER\s*[:=-]?\s*)?\(?([A-E1-5])\)?[.]?', value)
+    return m.group(1) if m and m.group(1) in allowed else None
+
+def exact_mcnemar_p(b, c):
+    """Two-sided exact binomial McNemar (discordant-pair counts)."""
+    n = b + c
+    if n == 0: return 1.0
+    return min(1., 2. * sum(math.comb(n,k) for k in range(min(b,c)+1)) / (2 ** n))
+
+def bootstrap_pair_ci(differences, seed=2026, samples=2000):
+    if not differences: return None, None
+    randomizer=random.Random(seed); n=len(differences)
+    values=sorted(sum(randomizer.choices(differences,k=n))/n for _ in range(samples))
+    return values[int(.025*(samples-1))],values[int(.975*(samples-1))]
+
+def summarise(rows):
+    grouped=defaultdict(dict)
+    for row in rows:
+        key=(row['task_id'],str(row['repeat']))
+        grouped[key][row['architecture']]=row
+    pairs=[v for v in grouped.values() if 'single' in v and 'two_role' in v]
+    if not pairs: raise ValueError('No paired experiments found')
+    b=sum(p['single']['correct'] and not p['two_role']['correct'] for p in pairs)
+    c=sum(p['two_role']['correct'] and not p['single']['correct'] for p in pairs)
+    delta=[int(p['two_role']['correct'])-int(p['single']['correct']) for p in pairs]
+    stats={}
+    for arch in ('single','two_role'):
+        subset=[p[arch] for p in pairs]
+        stats[arch]={
+          'n':len(subset), 'correct':sum(bool(r['correct']) for r in subset),
+          'accuracy':sum(bool(r['correct']) for r in subset)/len(subset),
+          'total_seconds':sum(float(r['seconds']) for r in subset),
+          'median_seconds':statistics.median(float(r['seconds']) for r in subset),
+          'generated_tokens':sum(int(r['output_tokens']) for r in subset),
+          'input_tokens':sum(int(r['input_tokens']) for r in subset),
+          'unparseable':sum(r['parsed'] is None for r in subset)
+        }
+    lo,hi=bootstrap_pair_ci(delta)
+    return {'paired_n':len(pairs),'single_correct_two_role_wrong':b,
+       'two_role_correct_single_wrong':c,'mcnemar_exact_p':exact_mcnemar_p(b,c),
+       'accuracy_difference_two_role_minus_single':sum(delta)/len(delta),
+       'paired_bootstrap_95pct_ci':[lo,hi], 'architectures':stats,
+       'warning':'Exploratory model-specific test. Never claim general multi-agent superiority. Paired bootstrap CI is a descriptive uncertainty estimate.'}
+
+class LocalFlan:
+    def __init__(self, model_id, model_revision):
+        import torch
+        from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+        self.torch=torch
+        self.tokenizer=AutoTokenizer.from_pretrained(model_id, revision=model_revision)
+        self.model=AutoModelForSeq2SeqLM.from_pretrained(model_id, revision=model_revision)
+        self.model.eval()
+    def ask(self,prompt):
+        torch=self.torch
+        start=time.perf_counter()
+        encoded=self.tokenizer(prompt,return_tensors='pt',truncation=True,max_length=384)
+        with torch.inference_mode():
+            generated=self.model.generate(**encoded,max_new_tokens=10,do_sample=False,num_beams=1)
+        duration=time.perf_counter()-start
+        answer=self.tokenizer.decode(generated[0],skip_special_tokens=True)
+        return {'text':answer,'seconds':duration,
+            'input_tokens':int(encoded['input_ids'].shape[-1]),
+            'output_tokens':int(generated[0].shape[-1])}
+
+def run(args):
+    from datasets import load_dataset
+    from huggingface_hub import HfApi
+    output=Path(args.out); output.mkdir(parents=True,exist_ok=True)
+    api=HfApi()
+    data_sha=api.dataset_info(DATASET_ID,revision='main').sha
+    model_sha=api.model_info(args.model,revision='main').sha
+    if not data_sha or not model_sha: raise RuntimeError('Failed to pin dataset and model')
+    ds=load_dataset(DATASET_ID,'ARC-Challenge',split='test',revision=data_sha)
+    indices=random.Random(args.seed).sample(range(len(ds)),min(args.tasks,len(ds)))
+    engine=LocalFlan(args.model,model_sha)
+    records=[]; started=datetime.now(timezone.utc).isoformat()
+    # Complete every paired task even if a model output is unparseable (it scores wrong).
+    for rep in range(args.repeats):
+      for i in indices:
+        ex=ds[i]
+        labels=[str(x).strip().upper() for x in ex['choices']['label']]
+        options='\n'.join(f'{label}. {answer}' for label,answer in zip(labels,ex['choices']['text']))
+        task=f"Question: {ex['question']}\nChoices:\n{options}\n"
+        p1=f"Choose the correct option. Respond with one option label only.\n{task}Answer:"
+        first=engine.ask(p1)
+        draft=parse_letter(first['text'],labels)
+        rowbase={'task_id':str(ex['id']),'dataset':'ARC-Challenge','expected':str(ex['answerKey']).upper(),
+            'repeat':rep,'choices':labels,'dataset_index':i}
+        records.append({**rowbase,'architecture':'single','raw':first['text'],'parsed':draft,
+            'correct':int(draft==rowbase['expected']),'seconds':first['seconds'],
+            'input_tokens':first['input_tokens'],'output_tokens':first['output_tokens']})
+        # Two separately prompted roles with the SAME fixed open-weight model.
+        review_prompt=(f"You are a second reviewer. Re-evaluate independently and correct the draft if needed. "
+          f"Reply with the correct option label only.\n{task}Draft response: {first['text']}\nFinal answer:")
+        second=engine.ask(review_prompt)
+        final=parse_letter(second['text'],labels)
+        records.append({**rowbase,'architecture':'two_role','raw':second['text'],
+            'initial_raw':first['text'],'parsed':final,'correct':int(final==rowbase['expected']),
+            'seconds':first['seconds']+second['seconds'],
+            'input_tokens':first['input_tokens']+second['input_tokens'],
+            'output_tokens':first['output_tokens']+second['output_tokens']})
+    raw=output/'raw_results.jsonl'
+    with raw.open('w',encoding='utf8') as f:
+        for row in records: f.write(json.dumps(row,ensure_ascii=False)+'\n')
+    summary=summarise(records)
+    meta={'started_utc':started,'completed_utc':datetime.now(timezone.utc).isoformat(),
+      'dataset':DATASET_ID,'dataset_revision_sha':data_sha,'dataset_split':'test','dataset_config':'ARC-Challenge',
+      'model':args.model,'model_revision_sha':model_sha,'selected_indices':indices,'seed':args.seed,
+      'tasks':len(indices),'repeats':args.repeats,'python':sys.version,'platform':platform.platform(),
+      'transformers_version':__import__('transformers').__version__,
+      'torch_version':__import__('torch').__version__,
+      'architecture_note':'single = one model generation; two_role = draft and re-review using same weights',
+      'metric_note':'input/output tokens are local tokenizer counts, NOT provider billed tokens',
+      'github_run_id':os.getenv('GITHUB_RUN_ID'),'github_sha':os.getenv('GITHUB_SHA'),
+    'raw_sha256':sha256(raw)}
+    (output/'metadata.json').write_text(json.dumps(meta,indent=2),encoding='utf8')
+    (output/'summary.json').write_text(json.dumps(summary,indent=2),encoding='utf8')
+    with (output/'summary.csv').open('w',newline='',encoding='utf8') as f:
+      writer=csv.DictWriter(f,fieldnames=['architecture','n','correct','accuracy','total_seconds','median_seconds','input_tokens','generated_tokens','unparseable']);writer.writeheader()
+      for arch,row in summary['architectures'].items():writer.writerow({'architecture':arch,**row})
+    return summary
+
+def main():
+    p=argparse.ArgumentParser()
+    p.add_argument('--model',choices=MODELS,required=True)
+    p.add_argument('--tasks',type=int,default=100)
+    p.add_argument('--repeats',type=int,default=1)
+    p.add_argument('--seed',type=int,default=42)
+    p.add_argument('--out',default='open_results')
+    a=p.parse_args()
+    if not 1<=a.tasks<=300 or not 1<=a.repeats<=3: p.error('tasks 1..300; repeats 1..3')
+    try:
+        summary=run(a)
+        print(json.dumps(summary,indent=2))
+    except Exception as e:
+        Path(a.out).mkdir(parents=True,exist_ok=True)
+        (Path(a.out)/'FAILURE.txt').write_text(type(e).__name__+': '+str(e),encoding='utf8')
+        raise
+if __name__=='__main__':main()
