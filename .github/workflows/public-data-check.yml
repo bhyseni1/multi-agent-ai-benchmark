@@ -1,0 +1,26 @@
+name: Verify public benchmark acquisition
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  public-data:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Retrieve real publicly hosted task records
+        run: |
+          python -m benchmark.prepare --dataset gsm8k --limit 20 --seed 42
+          python -m benchmark.prepare --dataset arc-challenge --limit 20 --seed 42
+      - name: Verify manifests and row counts
+        run: python -m benchmark.verify_data data/gsm8k_test.csv data/arc-challenge_test.csv
+      - uses: actions/upload-artifact@v4
+        with:
+          name: verified-open-data-and-provenance
+          path: data/
+          retention-days: 14

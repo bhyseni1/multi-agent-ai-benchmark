@@ -1,0 +1,94 @@
+name: Live paid API benchmark pilot
+on:
+  workflow_dispatch:
+    inputs:
+      provider:
+        description: 'API provider (requires corresponding repository secret)'
+        required: true
+        type: choice
+        options: [openai, anthropic, gemini]
+      model:
+        description: 'Exact model identifier enabled for this account'
+        required: true
+        type: string
+      dataset:
+        description: 'Verified public dataset'
+        required: true
+        type: choice
+        options: [gsm8k, arc-challenge]
+      tasks:
+        description: 'Pilot tasks (1-20); real API billing applies'
+        required: true
+        default: '5'
+        type: string
+      repeats:
+        description: 'Repetitions (1-3)'
+        required: true
+        default: '1'
+        type: string
+permissions:
+  contents: read
+jobs:
+  live-pilot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      PROVIDER: ${{ inputs.provider }}
+      MODEL: ${{ inputs.model }}
+      DATASET: ${{ inputs.dataset }}
+      TASKS: ${{ inputs.tasks }}
+      REPEATS: ${{ inputs.repeats }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Validate inputs and API credentials
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os, sys
+          provider = os.environ['PROVIDER']
+          key = {'openai':'OPENAI_API_KEY','anthropic':'ANTHROPIC_API_KEY','gemini':'GEMINI_API_KEY'}[provider]
+          try:
+              tasks=int(os.environ['TASKS']); repeats=int(os.environ['REPEATS'])
+          except ValueError:
+              sys.exit('Tasks and repeats must be integers')
+          if not (1 <= tasks <= 20 and 1 <= repeats <= 3):
+              sys.exit('Pilot restricted to 1-20 tasks and 1-3 repeats')
+          if not os.environ.get(key):
+              sys.exit('Missing required GitHub Actions secret: '+key)
+          if not os.environ['MODEL'].strip():
+              sys.exit('Exact model identifier required')
+          print('Input validation successful; live API calls will be billed by provider.')
+          PY
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Verify local code
+        run: python -m pytest -q
+      - name: Download public benchmark records and resolve immutable dataset revision
+        run: python -m benchmark.prepare --dataset "$DATASET" --limit "$TASKS" --seed 42 --out "data/${DATASET}_test.csv"
+      - name: Verify source manifests
+        run: python -m benchmark.verify_data "data/${DATASET}_test.csv"
+      - name: Record runtime environment
+        run: |
+          python --version > runtime-environment.txt
+          python -m pip freeze >> runtime-environment.txt
+          git rev-parse HEAD >> runtime-environment.txt
+      - name: Execute real calls (no mocked data)
+        run: python -m benchmark.experiment --provider "$PROVIDER" --model "$MODEL" --dataset "data/${DATASET}_test.csv" --repeats "$REPEATS" --seed 42 --out results
+      - name: Upload raw evidence even when execution fails
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-pilot-evidence-${{ github.run_id }}
+          path: |
+            data/
+            results/
+            runtime-environment.txt
+          if-no-files-found: warn
+          retention-days: 30
